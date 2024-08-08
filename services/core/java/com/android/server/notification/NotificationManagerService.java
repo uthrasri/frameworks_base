@@ -717,17 +717,21 @@ public class NotificationManagerService extends SystemService {
 
     private static final class ToastRecord
     {
+        final int uid;
         final int pid;
         final String pkg;
+        final boolean isSystemToast;
         final ITransientNotification callback;
         int duration;
         int displayId;
         Binder token;
 
-        ToastRecord(int pid, String pkg, ITransientNotification callback, int duration,
+        ToastRecord(int uid, int pid, String pkg, boolean isSystemToast, ITransientNotification callback, int duration,
                 Binder token, int displayId) {
+            this.uid = uid;
             this.pid = pid;
             this.pkg = pkg;
+            this.isSystemToast = isSystemToast;
             this.callback = callback;
             this.duration = duration;
             this.token = token;
@@ -2372,10 +2376,21 @@ public class NotificationManagerService extends SystemService {
 
                         Binder token = new Binder();
                         mWindowManagerInternal.addWindowToken(token, TYPE_TOAST, displayId);
-                        record = new ToastRecord(callingPid, pkg, callback, duration, token,
+                        record = new ToastRecord(callingUid, callingPid, pkg, isSystemToast, callback, duration, token,
                                 displayId);
-                        mToastQueue.add(record);
-                        index = mToastQueue.size() - 1;
+
+                        // Insert system toasts at the front of the queue
+                        int systemToastInsertIdx = mToastQueue.size();
+                        if (isSystemToast) {
+                            systemToastInsertIdx = getInsertIndexForSystemToastLocked();
+                        }
+                        if (systemToastInsertIdx < mToastQueue.size()) {
+                            index = systemToastInsertIdx;
+                            mToastQueue.add(index, record);
+                        } else {
+                            mToastQueue.add(record);
+                            index = mToastQueue.size() - 1;
+                        }
                         keepProcessAliveIfNeededLocked(callingPid);
                     }
                     // If it's at index 0, it's the current toast.  It doesn't matter if it's
@@ -2389,6 +2404,23 @@ public class NotificationManagerService extends SystemService {
                     Binder.restoreCallingIdentity(callingId);
                 }
             }
+        }
+
+        @GuardedBy("mToastQueue")
+        private int getInsertIndexForSystemToastLocked() {
+            // If there are other system toasts: insert after the last one
+            int idx = 0;
+            for (ToastRecord r : mToastQueue) {
+                if (idx == 0 && mIsCurrentToastShown) {
+                    idx++;
+                    continue;
+                }
+                if (!r.isSystemToast) {
+                    return idx;
+                }
+                idx++;
+            }
+            return idx;
         }
 
         @Override
@@ -3080,6 +3112,7 @@ public class NotificationManagerService extends SystemService {
             }
         }
 
+        /** Notifications returned here will have allowlistToken stripped from them. */
         private StatusBarNotification sanitizeSbn(String pkg, int userId,
                 StatusBarNotification sbn) {
             if (sbn.getUserId() == userId) {
@@ -3087,11 +3120,16 @@ public class NotificationManagerService extends SystemService {
                     // We could pass back a cloneLight() but clients might get confused and
                     // try to send this thing back to notify() again, which would not work
                     // very well.
+                    Notification notification = sbn.getNotification().clone();
+                    // Remove background token before returning notification to untrusted app, this
+                    // ensures the app isn't able to perform background operations that are
+                    // associated with notification interactions.
+                    notification.setAllowlistToken(null);
                     return new StatusBarNotification(
                             sbn.getPackageName(),
                             sbn.getOpPkg(),
                             sbn.getId(), sbn.getTag(), sbn.getUid(), sbn.getInitialPid(),
-                            sbn.getNotification().clone(),
+                            notification,
                             sbn.getUser(), sbn.getOverrideGroupKey(), sbn.getPostTime());
                 }
             }
